@@ -1,0 +1,119 @@
+# Python Modules for Security Testing
+
+## Network & Recon
+
+```python
+import socket
+import nmap
+import requests
+import scapy
+```
+
+```python
+# Example: Simple port scanner
+import socket
+
+def scan_port(target, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1)
+    result = sock.connect_ex((target, port))
+    sock.close()
+    return result == 0
+
+# Usage
+for port in [80, 443, 22, 445]:
+    print(f"Port {port}: {'Open' if scan_port('192.168.1.1', port) else 'Closed'}")
+```
+
+## Web Testing
+
+```python
+import requests
+from bs4 import BeautifulSoup
+import urllib3
+```
+
+```python
+# Example: HTTP requests with sessions
+import requests
+
+session = requests.Session()
+response = session.get('http://target.com/login')
+response = session.post('http://target.com/login', data={
+    'username': 'admin',
+    'password': 'password'
+})
+```
+
+## Active Directory / Impacket
+
+```python
+from impacket.smbconnection import SMBConnection
+from impacket.dcerpc.v5 import nrpc, transport
+from impacket.krb5.kerberosv5 import getKerberosTGT
+```
+
+## Exploitation
+
+```python
+import pwntools  # CTF and exploitation
+from pwn import *
+```
+
+```python
+# Example: Simple buffer overflow
+from pwn import *
+
+p = process('./vulnerable_program')
+p.sendline(b'A' * 100)
+print(p.recvall())
+```
+
+## Cryptography
+
+```python
+import hashlib
+import base64
+from cryptography.fernet import Fernet
+```
+
+## Active Directory
+
+```python
+from ldap3 import Server, Connection, ALL
+import winrm
+```
+
+```python
+# Example: LDAP connection
+from ldap3 import Server, Connection, ALL
+
+server = Server('ldap://dc01.local', get_info=ALL)
+conn = Connection(server, 'admin@local', 'password', auto_bind=True)
+conn.search('dc=local', '(objectClass=user)')
+```
+
+## Utility Libraries
+
+```python
+# Output formatting
+import colorama
+from termcolor import colored
+
+# CLI
+import argparse
+import cmd
+
+# File operations
+import os
+import glob
+
+# JSON handling
+import json
+```
+
+## Installation
+
+```bash
+pip install requests beautifulsoup4 impacket pwntools ldap3 colorama termcolor
+```
