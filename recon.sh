@@ -2,12 +2,12 @@
 
 set -euo pipefail
 
-############################
-# OOM Protection
-############################
-# Cap virtual memory at 6 GB to prevent system crash
-ulimit -Sv 6291456 2>/dev/null || true
+# Ensure user's Go tool bins are in PATH (needed when running via sudo)
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(eval echo "~$REAL_USER")
+export PATH="$REAL_HOME/.pdtm/go/bin:$REAL_HOME/go/bin:$PATH"
 
+############################
 ############################
 # Colors
 ############################
@@ -38,7 +38,6 @@ ${YELLOW}OPTIONS:${NC}
   --skip-scope            Skip scope broadening (ASN/whois)
   --skip-nuclei           Skip Nuclei vulnerability scan
   --skip-jsleaks          Skip Mantra JS secret scan
-  --skip-portscan         Skip naabu port scan
   --skip-katana           Skip Katana crawl (JS, params extraction)
   --proxy                 Proxy URL (e.g., http://localhost:8080 for Caido)
   --rate, -c             Requests per second (e.g., -c 5 for 5 req/sec)
@@ -76,7 +75,6 @@ EOF
 SKIP_NUCLEI=false
 SKIP_JSLEAKS=false
 SKIP_SCOPE=false
-SKIP_PORTSCAN=false
 SKIP_KATANA=false
 PROXY=""
 RATE=""
@@ -108,9 +106,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-scope)
       SKIP_SCOPE=true
-      ;;
-    --skip-portscan)
-      SKIP_PORTSCAN=true
       ;;
     --skip-katana)
       SKIP_KATANA=true
@@ -150,7 +145,10 @@ mkdir -p "$outdir"
 ############################
 # Required Tools
 ############################
-tools=(subfinder assetfinder amass httpx naabu nuclei anew katana notify mantra alterx puredns chaos asnmap)
+tools=(subfinder assetfinder amass httpx anew alterx puredns chaos asnmap)
+[ "$SKIP_NUCLEI" = false ] && tools+=(nuclei notify)
+[ "$SKIP_KATANA" = false ] && tools+=(katana)
+[ "$SKIP_JSLEAKS" = false ] && [ "$SKIP_KATANA" = false ] && tools+=(mantra)
 
 for tool in "${tools[@]}"; do
   if ! command -v "$tool" &>/dev/null; then
@@ -166,7 +164,6 @@ subs="$outdir/subdomains.txt"
 live="$(pwd)/$outdir/live_hosts.txt"
 tech_file="$outdir/tech_stack.txt"
 js="$outdir/jsfiles.txt"
-ports="$outdir/ports.txt"
 nuclei_out="$outdir/nuclei_results.txt"
 mantra_out="$outdir/mantra_results.txt"
 resolved="$outdir/resolved_subs.txt"
@@ -285,21 +282,17 @@ fi
 # 3. Katana Crawl
 ############################
 if [ "$SKIP_KATANA" = false ]; then
-  js="$outdir/jsfiles.txt"
-  js_all="$outdir/all_js.txt"
-
   if [ ! -f "$done_dir/katana.done" ]; then
-    echo -e "${BLUE}[*] Running katana crawl for URLs, params, and JS files${NC}"
+    echo -e "${BLUE}[*] Running katana crawl${NC}"
     katana_opts=(
       -list "$live"
-      -d 2                          # depth 2 (3 was causing OOM)
+      -d 1                          # depth 1
       -jc -jsluice
       -ef woff,css,svg,png,jpg,gif
       -silent
-      -c 10                         # max 10 concurrent crawls
-      -p 500                        # max 500 pages per host
-      -ct 30                        # 30s request timeout
-      -t 2                          # 2 threads to reduce CPU pressure
+      -c 3                          # max 3 concurrent crawls
+      -p 50                         # max 50 pages per host
+      -ct 15                        # 15s request timeout
       -o "$outdir/katana_urls.txt"
     )
     if [ -n "$PROXY" ]; then
@@ -309,22 +302,28 @@ if [ "$SKIP_KATANA" = false ]; then
       katana_opts+=( -rl "$RATE" )
     fi
     katana "${katana_opts[@]}"
-
-    echo -e "${YELLOW}[*] Extracting JS files from katana crawl${NC}"
-    grep -E ".*\.js($|\\?.*)" "$outdir/katana_urls.txt" | anew "$js_all" || true
-    cp "$js_all" "$js" 2>/dev/null || true
-
-    echo -e "${YELLOW}[*] Extracting URLs with query parameters from katana${NC}"
-    grep "=" "$outdir/katana_urls.txt" | anew "$outdir/katana_params.txt" || true
-
     echo -e "${GREEN}[+] Katana URLs: $(wc -l <"$outdir/katana_urls.txt" 2>/dev/null || echo 0)${NC}"
-    echo -e "${GREEN}[+] Total JS files: $(wc -l <"$js_all" 2>/dev/null || echo 0)${NC}"
     mkdir -p "$done_dir" && touch "$done_dir/katana.done"
   fi
 else
-  echo -e "${YELLOW}[*] Skipping Katana crawl and related extractions${NC}"
-  js="$outdir/jsfiles.txt"
-  js_all="$outdir/all_js.txt"
+  echo -e "${YELLOW}[*] Skipping Katana crawl${NC}"
+fi
+
+############################
+# 3b. Extract JS & Params from Katana
+############################
+js="$outdir/jsfiles.txt"
+js_all="$outdir/all_js.txt"
+if [ -f "$outdir/katana_urls.txt" ] && [ -s "$outdir/katana_urls.txt" ]; then
+  echo -e "${YELLOW}[*] Extracting JS files from katana crawl${NC}"
+  grep -E ".*\.js($|\\?.*)" "$outdir/katana_urls.txt" | anew "$js_all" || true
+  cp "$js_all" "$js" 2>/dev/null || true
+  echo -e "${YELLOW}[*] Extracting URLs with query parameters from katana${NC}"
+  grep "=" "$outdir/katana_urls.txt" | anew "$outdir/katana_params.txt" || true
+  echo -e "${GREEN}[+] Total JS files: $(wc -l <"$js_all" 2>/dev/null || echo 0)${NC}"
+else
+  echo -e "${YELLOW}[!] No katana URLs to filter${NC}"
+  touch "$js_all" "$js"
 fi
 
 ############################
@@ -348,25 +347,7 @@ if [ "$SKIP_JSLEAKS" = false ] && [ ! -f "$done_dir/mantra.done" ]; then
 fi
 
 ############################
-# 5. Port Scan
-############################
-if [ "$SKIP_PORTSCAN" = false ]; then
-  if [ ! -f "$done_dir/ports.done" ]; then
-    echo -e "${BLUE}[*] Running naabu port scan${NC}"
-    naabu_rate="${RATE:-5000}"
-    # remove -verify (TCP connect after SYN = 2x slower)
-    # SYN scan (-s s) ignores --proxy, so drop proxy from naabu
-    sed 's|https://||;s|http://||' "$live" | cut -d':' -f1 | \
-      naabu -silent -s s -top-ports 1000 -rate "$naabu_rate" -o "$ports"
-    echo -e "${GREEN}[+] Open ports found: $(wc -l <"$ports")${NC}"
-    mkdir -p "$done_dir" && touch "$done_dir/ports.done"
-  fi
-else
-  echo -e "${YELLOW}[*] Skipping port scan${NC}"
-fi
-
-############################
-# 6. Nuclei Scan
+# 5. Nuclei Scan
 ############################
 if [ "$SKIP_NUCLEI" = false ]; then
   if [ ! -f "$done_dir/nuclei.done" ]; then
@@ -390,13 +371,13 @@ else
 fi
 
 ############################
-# 7. Subdomain Permutations (alterx + puredns)
+# 6. Subdomain Permutations (alterx + puredns)
 ############################
 alt_file="$outdir/alterx_subs.txt"
 if [ ! -f "$done_dir/alterx.done" ]; then
   echo -e "${BLUE}[*] Generating subdomain permutations with alterx${NC}"
   if [ -f "$subs" ] && [ -s "$subs" ]; then
-    alterx -l "$subs" -silent -en -o "$alt_file" 2>/dev/null || true
+    alterx -l "$subs" -silent -en 2>/dev/null | head -50000 > "$alt_file" || true
     if [ -f "$alt_file" ] && [ -s "$alt_file" ]; then
       echo -e "${GREEN}[+] alterx generated $(wc -l <"$alt_file") permutations${NC}"
       echo -e "${BLUE}[*] Resolving with puredns${NC}"
@@ -422,10 +403,9 @@ generate_report() {
   local domain
   domain=$(basename "$dir")
 
-  local sub_count live_count ports_count scope_count nuclei_count mantra_count js_all_count katana_count params_count resolved_count
+  local sub_count live_count scope_count nuclei_count mantra_count js_all_count katana_count params_count resolved_count
   sub_count=$([ -f "$dir/subdomains.txt" ] && wc -l < "$dir/subdomains.txt" || echo 0)
   live_count=$([ -f "$dir/live_hosts.txt" ] && wc -l < "$dir/live_hosts.txt" || echo 0)
-  ports_count=$([ -f "$dir/ports.txt" ] && wc -l < "$dir/ports.txt" || echo 0)
   scope_count=$([ -f "$dir/broad_scope.txt" ] && wc -l < "$dir/broad_scope.txt" || echo 0)
   nuclei_count=$([ -f "$dir/nuclei_results.txt" ] && wc -l < "$dir/nuclei_results.txt" || echo 0)
   mantra_count=$([ -f "$dir/mantra_results.txt" ] && wc -l < "$dir/mantra_results.txt" || echo 0)
@@ -500,7 +480,6 @@ REPORT
   printf >&3 '\n<div class="stats">'
   printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Subdomains</div></div>' "$sub_count"
   printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Live Hosts</div></div>' "$live_count"
-  printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Open Ports</div></div>' "$ports_count"
   [ "$scope_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Scope CIDRs</div></div>' "$scope_count" || true
   [ "$resolved_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Resolved Subs</div></div>' "$resolved_count" || true
   [ "$nuclei_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num" style="color:#da3633">%s</div><div class="label">Nuclei Findings</div></div>' "$nuclei_count" || true
@@ -564,21 +543,6 @@ REPORT
     printf >&3 '</table>\n'
   else
     printf >&3 '<div class="empty-state">No CIDR ranges discovered</div>\n'
-  fi
-  section_footer
-
-  section_header "Open Ports" "$ports_count"
-  if [ -f "$dir/ports.txt" ] && [ -s "$dir/ports.txt" ]; then
-    printf >&3 '<table>\n'
-    while IFS= read -r line || [ -n "$line" ]; do
-      [ -z "$line" ] && continue
-      local escaped
-      escaped=$(printf '%s' "$line" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      printf >&3 '<tr><td><span class="badge badge-critical">OPEN</span>%s</td></tr>\n' "$escaped"
-    done < "$dir/ports.txt"
-    printf >&3 '</table>\n'
-  else
-    printf >&3 '<div class="empty-state">No open ports found</div>\n'
   fi
   section_footer
 
@@ -708,7 +672,6 @@ echo -e "Scope CIDRs    : $([ -f "$cidr_file" ] && wc -l <"$cidr_file" || echo 0
 echo -e "JS Files       : $([ -f "$js" ] && wc -l <"$js" || echo 0)"
 echo -e "All JS Files   : $([ -f "$js_all" ] && wc -l <"$js_all" || echo 0)"
 echo -e "Katana URLs    : $([ -f "$outdir/katana_urls.txt" ] && wc -l <"$outdir/katana_urls.txt" || echo 0)"
-echo -e "Open Ports     : $([ -f "$ports" ] && wc -l <"$ports" || echo 0)"
 echo -e "Resolved Subs  : $([ -f "$resolved" ] && wc -l <"$resolved" || echo 0)"
 if [ -n "$PROXY" ]; then
   echo -e "Proxy         : $PROXY"
