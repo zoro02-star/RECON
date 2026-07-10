@@ -3,6 +3,12 @@
 set -euo pipefail
 
 ############################
+# OOM Protection
+############################
+# Cap virtual memory at 6 GB to prevent system crash
+ulimit -Sv 6291456 2>/dev/null || true
+
+############################
 # Colors
 ############################
 RED="\033[0;31m"
@@ -33,8 +39,6 @@ ${YELLOW}OPTIONS:${NC}
   --skip-nuclei           Skip Nuclei vulnerability scan
   --skip-jsleaks          Skip Mantra JS secret scan
   --skip-portscan         Skip naabu port scan
-  --skip-screenshots      Skip gowitness screenshots
-  --skip-xss              Skip dalfox XSS scan
   --skip-katana           Skip Katana crawl (JS, params extraction)
   --proxy                 Proxy URL (e.g., http://localhost:8080 for Caido)
   --rate, -c             Requests per second (e.g., -c 5 for 5 req/sec)
@@ -53,13 +57,11 @@ ${YELLOW}DESCRIPTION:${NC}
     0. Scope Broadening (ASN/whois discovery)
     1. Subdomain Enumeration (subfinder, assetfinder, amass, chaos)
     2. Live Host Detection (httpx)
-    3. Katana Crawl (deep URL/JS/params discovery)
-     4. Mantra JS Secret Scan (API key leak detection)
-     5. Port Scanning (naabu)
-     5b. Screenshots (gowitness)
-     5c. XSS Scanning (dalfox)
-     6. Vulnerability Scanning (nuclei)
-     7. Subdomain Permutations (alterx + puredns)
+     3. Katana Crawl (deep URL/JS/params discovery)
+      4. Mantra JS Secret Scan (API key leak detection)
+      5. Port Scanning (naabu)
+      6. Vulnerability Scanning (nuclei)
+      7. Subdomain Permutations (alterx + puredns)
   All results are saved in a directory named after the target domain.
   Skipped steps will not be executed, and their output files will not be created.
 
@@ -75,8 +77,6 @@ SKIP_NUCLEI=false
 SKIP_JSLEAKS=false
 SKIP_SCOPE=false
 SKIP_PORTSCAN=false
-SKIP_SCREENSHOTS=false
-SKIP_XSS=false
 SKIP_KATANA=false
 PROXY=""
 RATE=""
@@ -111,12 +111,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-portscan)
       SKIP_PORTSCAN=true
-      ;;
-    --skip-screenshots)
-      SKIP_SCREENSHOTS=true
-      ;;
-    --skip-xss)
-      SKIP_XSS=true
       ;;
     --skip-katana)
       SKIP_KATANA=true
@@ -156,7 +150,7 @@ mkdir -p "$outdir"
 ############################
 # Required Tools
 ############################
-tools=(subfinder assetfinder amass httpx naabu nuclei anew katana notify mantra alterx puredns chaos gowitness dalfox asnmap waybackurls gf qsreplace)
+tools=(subfinder assetfinder amass httpx naabu nuclei anew katana notify mantra alterx puredns chaos asnmap)
 
 for tool in "${tools[@]}"; do
   if ! command -v "$tool" &>/dev/null; then
@@ -179,12 +173,13 @@ resolved="$outdir/resolved_subs.txt"
 scope_file="$outdir/broad_scope.txt"
 cidr_file="$outdir/cidr_ranges.txt"
 ip_file="$outdir/ip_addrs.txt"
+done_dir="$outdir/.done"
 
 ############################
 # 0. Scope Broadening
 ############################
 if [ "$SKIP_SCOPE" = false ]; then
-  if [ ! -f "$scope_file" ]; then
+  if [ ! -f "$done_dir/scope.done" ]; then
     echo -e "${BLUE}[*] Broadening scope for $domain${NC}"
     touch "$scope_file"
 
@@ -215,6 +210,7 @@ if [ "$SKIP_SCOPE" = false ]; then
     echo -e "${GREEN}[+] Whois info saved${NC}"
 
     echo -e "${BLUE}[*] Scope broadening complete. Saved to $scope_file${NC}"
+    mkdir -p "$done_dir" && touch "$done_dir/scope.done"
   fi
 else
   echo -e "${YELLOW}[*] Skipping scope broadening${NC}"
@@ -223,7 +219,7 @@ fi
 ############################
 # 1. Subdomain Enumeration
 ############################
-if [ ! -f "$subs" ]; then
+if [ ! -f "$done_dir/subs.done" ]; then
   echo -e "${BLUE}[*] Running subdomain enumeration${NC}"
   (
     if [ -n "$PROXY" ] && [ -n "$RATE" ]; then
@@ -250,29 +246,30 @@ if [ ! -f "$subs" ]; then
     wait
   ) | anew "$subs"
   echo -e "${GREEN}[+] Found $(wc -l <"$subs") subdomains${NC}"
+  mkdir -p "$done_dir" && touch "$done_dir/subs.done"
 fi
 
 ############################
 # 2. Live Hosts
 ############################
-if [ ! -f "$live" ]; then
+if [ ! -f "$done_dir/live.done" ]; then
   echo -e "${BLUE}[*] Checking live hosts${NC}"
-  if [ -n "$PROXY" ] && [ -n "$RATE" ]; then
-    cat "$subs" | httpx -silent -threads 100 -rl "$RATE" -proxy "$PROXY" | anew "$live"
-  elif [ -n "$PROXY" ]; then
-    cat "$subs" | httpx -silent -threads 100 -proxy "$PROXY" | anew "$live"
-  elif [ -n "$RATE" ]; then
-    cat "$subs" | httpx -silent -threads 100 -rl "$RATE" | anew "$live"
-  else
-    cat "$subs" | httpx -silent -threads 100 | anew "$live"
+  httpx_opts=( -silent -threads 50 -retries 1 )
+  if [ -n "$PROXY" ]; then
+    httpx_opts+=( -proxy "$PROXY" )
   fi
+  if [ -n "$RATE" ]; then
+    httpx_opts+=( -rl "$RATE" )
+  fi
+  cat "$subs" | httpx "${httpx_opts[@]}" | anew "$live"
   echo -e "${GREEN}[+] Live hosts: $(wc -l <"$live")${NC}"
+  mkdir -p "$done_dir" && touch "$done_dir/live.done"
 fi
 
 ############################
 # 2b. Tech Stack Detection
 ############################
-if [ ! -f "$tech_file" ]; then
+if [ ! -f "$done_dir/tech.done" ]; then
   echo -e "${BLUE}[*] Detecting technology stacks${NC}"
   if [ -f "$live" ] && [ -s "$live" ]; then
     cat "$live" | httpx -silent -td 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^\(https\?:\/\/[^ ]*\) \[\(.*\)\]$/\1: \2/' > "$tech_file" || true
@@ -281,6 +278,7 @@ if [ ! -f "$tech_file" ]; then
     echo -e "${YELLOW}[!] No live hosts to scan for tech${NC}"
     touch "$tech_file"
   fi
+  mkdir -p "$done_dir" && touch "$done_dir/tech.done"
 fi
 
 ############################
@@ -290,17 +288,27 @@ if [ "$SKIP_KATANA" = false ]; then
   js="$outdir/jsfiles.txt"
   js_all="$outdir/all_js.txt"
 
-  if [ ! -f "$js_all" ]; then
+  if [ ! -f "$done_dir/katana.done" ]; then
     echo -e "${BLUE}[*] Running katana crawl for URLs, params, and JS files${NC}"
-    if [ -n "$PROXY" ] && [ -n "$RATE" ]; then
-      katana -list "$live" -d 3 -jc -jsluice -ef woff,css,svg,png,jpg,gif -silent -rl "$RATE" -proxy "$PROXY" | anew "$outdir/katana_urls.txt"
-    elif [ -n "$PROXY" ]; then
-      katana -list "$live" -d 3 -jc -jsluice -ef woff,css,svg,png,jpg,gif -silent -proxy "$PROXY" | anew "$outdir/katana_urls.txt"
-    elif [ -n "$RATE" ]; then
-      katana -list "$live" -d 3 -jc -jsluice -ef woff,css,svg,png,jpg,gif -silent -rl "$RATE" | anew "$outdir/katana_urls.txt"
-    else
-      katana -list "$live" -d 3 -jc -jsluice -ef woff,css,svg,png,jpg,gif -silent | anew "$outdir/katana_urls.txt"
+    katana_opts=(
+      -list "$live"
+      -d 2                          # depth 2 (3 was causing OOM)
+      -jc -jsluice
+      -ef woff,css,svg,png,jpg,gif
+      -silent
+      -c 10                         # max 10 concurrent crawls
+      -p 500                        # max 500 pages per host
+      -ct 30                        # 30s request timeout
+      -t 2                          # 2 threads to reduce CPU pressure
+      -o "$outdir/katana_urls.txt"
+    )
+    if [ -n "$PROXY" ]; then
+      katana_opts+=( -proxy "$PROXY" )
     fi
+    if [ -n "$RATE" ]; then
+      katana_opts+=( -rl "$RATE" )
+    fi
+    katana "${katana_opts[@]}"
 
     echo -e "${YELLOW}[*] Extracting JS files from katana crawl${NC}"
     grep -E ".*\.js($|\\?.*)" "$outdir/katana_urls.txt" | anew "$js_all" || true
@@ -311,6 +319,7 @@ if [ "$SKIP_KATANA" = false ]; then
 
     echo -e "${GREEN}[+] Katana URLs: $(wc -l <"$outdir/katana_urls.txt" 2>/dev/null || echo 0)${NC}"
     echo -e "${GREEN}[+] Total JS files: $(wc -l <"$js_all" 2>/dev/null || echo 0)${NC}"
+    mkdir -p "$done_dir" && touch "$done_dir/katana.done"
   fi
 else
   echo -e "${YELLOW}[*] Skipping Katana crawl and related extractions${NC}"
@@ -321,7 +330,7 @@ fi
 ############################
 # 4. Mantra JS Secret Scan
 ############################
-if [ "$SKIP_JSLEAKS" = false ]; then
+if [ "$SKIP_JSLEAKS" = false ] && [ ! -f "$done_dir/mantra.done" ]; then
   js_scan_file="$js_all"
   if [ ! -f "$js_scan_file" ] || [ ! -s "$js_scan_file" ]; then
     js_scan_file="$js"
@@ -334,6 +343,7 @@ if [ "$SKIP_JSLEAKS" = false ]; then
       cat "$js_scan_file" | mantra -s | anew "$mantra_out" || true
     fi
     echo -e "${GREEN}[+] Mantra scan complete: $(wc -l <"$mantra_out" 2>/dev/null || echo 0) findings${NC}"
+    mkdir -p "$done_dir" && touch "$done_dir/mantra.done"
   fi
 fi
 
@@ -341,86 +351,39 @@ fi
 # 5. Port Scan
 ############################
 if [ "$SKIP_PORTSCAN" = false ]; then
-  if [ ! -f "$ports" ]; then
+  if [ ! -f "$done_dir/ports.done" ]; then
     echo -e "${BLUE}[*] Running naabu port scan${NC}"
-    if [ -n "$PROXY" ] && [ -n "$RATE" ]; then
-      sed 's|https://||;s|http://||' "$live" | cut -d':' -f1 | naabu -silent -s s -verify -top-ports 1000 -rate "$RATE" -proxy "$PROXY" -o "$ports"
-    elif [ -n "$PROXY" ]; then
-      sed 's|https://||;s|http://||' "$live" | cut -d':' -f1 | naabu -silent -s s -verify -top-ports 1000 -proxy "$PROXY" -o "$ports"
-    elif [ -n "$RATE" ]; then
-      sed 's|https://||;s|http://||' "$live" | cut -d':' -f1 | naabu -silent -s s -verify -top-ports 1000 -rate "$RATE" -o "$ports"
-    else
-      sed 's|https://||;s|http://||' "$live" | cut -d':' -f1 | naabu -silent -s s -verify -top-ports 1000 -o "$ports"
-    fi
+    naabu_rate="${RATE:-5000}"
+    # remove -verify (TCP connect after SYN = 2x slower)
+    # SYN scan (-s s) ignores --proxy, so drop proxy from naabu
+    sed 's|https://||;s|http://||' "$live" | cut -d':' -f1 | \
+      naabu -silent -s s -top-ports 1000 -rate "$naabu_rate" -o "$ports"
     echo -e "${GREEN}[+] Open ports found: $(wc -l <"$ports")${NC}"
+    mkdir -p "$done_dir" && touch "$done_dir/ports.done"
   fi
 else
   echo -e "${YELLOW}[*] Skipping port scan${NC}"
 fi
 
 ############################
-# 5b. Screenshots
-############################
-if [ "$SKIP_SCREENSHOTS" = false ]; then
-  if [ -f "$ports" ] && [ -s "$ports" ]; then
-    echo -e "${BLUE}[*] Taking screenshots with gowitness${NC}"
-    mkdir -p "$outdir/screenshots"
-    sed 's/^/https:\/\//' "$ports" | gowitness scan file -f - -s "$outdir/screenshots" --no-http --write-jsonl --write-jsonl-file "$outdir/screenshots.jsonl" -q 2>/dev/null || true
-    sed 's/^/http:\/\//' "$ports" | gowitness scan file -f - -s "$outdir/screenshots" --no-https --write-jsonl --write-jsonl-file "$outdir/screenshots.jsonl" -q 2>/dev/null || true
-    screenshot_count=$(ls "$outdir/screenshots/"*.jpeg 2>/dev/null | wc -l)
-    echo -e "${GREEN}[+] Screenshots saved: $screenshot_count${NC}"
-  else
-    echo -e "${YELLOW}[!] No ports to screenshot${NC}"
-  fi
-else
-  echo -e "${YELLOW}[*] Skipping screenshots${NC}"
-fi
-
-############################
-# 5c. XSS Scan
-############################
-if [ "$SKIP_XSS" = false ]; then
-  if [ ! -f "$outdir/xss_results.txt" ]; then
-    echo -e "${BLUE}[*] Gathering URLs for XSS scan${NC}"
-    touch "$outdir/xss_urls.txt"
-    if [ -f "$live" ] && [ -s "$live" ]; then
-      cat "$live" | waybackurls 2>/dev/null | gf xss | anew "$outdir/xss_urls.txt" || true
-    fi
-    if [ -f "$outdir/katana_params.txt" ] && [ -s "$outdir/katana_params.txt" ]; then
-      cat "$outdir/katana_params.txt" | gf xss | anew "$outdir/xss_urls.txt" || true
-    fi
-    if [ -s "$outdir/xss_urls.txt" ]; then
-      echo -e "${BLUE}[*] Running dalfox XSS scan on $(wc -l <"$outdir/xss_urls.txt") URLs${NC}"
-      cat "$outdir/xss_urls.txt" | qsreplace yogi | dalfox pipe --mining-dom --deep-domxss --mining-dict -o "$outdir/xss_results.txt" 2>/dev/null || true
-      echo -e "${GREEN}[+] XSS findings: $(wc -l <"$outdir/xss_results.txt")${NC}"
-    else
-      echo -e "${YELLOW}[!] No XSS-prone URLs found${NC}"
-      touch "$outdir/xss_results.txt"
-    fi
-  fi
-else
-  echo -e "${YELLOW}[*] Skipping XSS scan${NC}"
-fi
-
-############################
 # 6. Nuclei Scan
 ############################
 if [ "$SKIP_NUCLEI" = false ]; then
-  if [ ! -f "$nuclei_out" ]; then
+  if [ ! -f "$done_dir/nuclei.done" ]; then
     echo -e "${BLUE}[*] Running nuclei scan${NC}"
-    if [ -n "$PROXY" ] && [ -n "$RATE" ]; then
-      nuclei -l "$live" -silent -rl "$RATE" -proxy "$PROXY" -o "$nuclei_out"
-    elif [ -n "$PROXY" ]; then
-      nuclei -l "$live" -silent -proxy "$PROXY" -o "$nuclei_out"
-    elif [ -n "$RATE" ]; then
-      nuclei -l "$live" -silent -rl "$RATE" -o "$nuclei_out"
-    else
-      nuclei -l "$live" -silent -o "$nuclei_out"
+    nuclei_opts=( -silent )
+    if [ -n "$PROXY" ]; then
+      nuclei_opts+=( -proxy "$PROXY" )
     fi
+    if [ -n "$RATE" ]; then
+      nuclei_opts+=( -rl "$RATE" )
+    fi
+    nuclei -l "$live" "${nuclei_opts[@]}" -o "$nuclei_out"
     if grep -qiE "critical|high" "$nuclei_out" 2>/dev/null; then
       notify -silent < "$nuclei_out"
     fi
     echo -e "${GREEN}[+] Nuclei findings: $(wc -l <"$nuclei_out")${NC}"
+    mkdir -p "$done_dir" && touch "$done_dir/nuclei.done"
   fi
 else
   echo -e "${YELLOW}[*] Skipping Nuclei scan${NC}"
@@ -430,7 +393,7 @@ fi
 # 7. Subdomain Permutations (alterx + puredns)
 ############################
 alt_file="$outdir/alterx_subs.txt"
-if [ ! -f "$resolved" ]; then
+if [ ! -f "$done_dir/alterx.done" ]; then
   echo -e "${BLUE}[*] Generating subdomain permutations with alterx${NC}"
   if [ -f "$subs" ] && [ -s "$subs" ]; then
     alterx -l "$subs" -silent -en -o "$alt_file" 2>/dev/null || true
@@ -447,6 +410,7 @@ if [ ! -f "$resolved" ]; then
     echo -e "${YELLOW}[!] No subdomains to permute${NC}"
     touch "$resolved"
   fi
+  mkdir -p "$done_dir" && touch "$done_dir/alterx.done"
 fi
 
 ############################
@@ -458,12 +422,10 @@ generate_report() {
   local domain
   domain=$(basename "$dir")
 
-  local sub_count live_count ports_count screenshot_count xss_count scope_count nuclei_count mantra_count js_all_count katana_count params_count resolved_count
+  local sub_count live_count ports_count scope_count nuclei_count mantra_count js_all_count katana_count params_count resolved_count
   sub_count=$([ -f "$dir/subdomains.txt" ] && wc -l < "$dir/subdomains.txt" || echo 0)
   live_count=$([ -f "$dir/live_hosts.txt" ] && wc -l < "$dir/live_hosts.txt" || echo 0)
   ports_count=$([ -f "$dir/ports.txt" ] && wc -l < "$dir/ports.txt" || echo 0)
-  screenshot_count=$(ls "$dir/screenshots/"*.jpeg 2>/dev/null | wc -l)
-  xss_count=$([ -f "$dir/xss_results.txt" ] && wc -l < "$dir/xss_results.txt" || echo 0)
   scope_count=$([ -f "$dir/broad_scope.txt" ] && wc -l < "$dir/broad_scope.txt" || echo 0)
   nuclei_count=$([ -f "$dir/nuclei_results.txt" ] && wc -l < "$dir/nuclei_results.txt" || echo 0)
   mantra_count=$([ -f "$dir/mantra_results.txt" ] && wc -l < "$dir/mantra_results.txt" || echo 0)
@@ -540,8 +502,6 @@ REPORT
   printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Live Hosts</div></div>' "$live_count"
   printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Open Ports</div></div>' "$ports_count"
   [ "$scope_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Scope CIDRs</div></div>' "$scope_count" || true
-  [ "$screenshot_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Screenshots</div></div>' "$screenshot_count" || true
-  [ "$xss_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num" style="color:#d29922">%s</div><div class="label">XSS Findings</div></div>' "$xss_count" || true
   [ "$resolved_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Resolved Subs</div></div>' "$resolved_count" || true
   [ "$nuclei_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num" style="color:#da3633">%s</div><div class="label">Nuclei Findings</div></div>' "$nuclei_count" || true
   [ "$mantra_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num" style="color:#f0883e">%s</div><div class="label">Secrets</div></div>' "$mantra_count" || true
@@ -674,38 +634,6 @@ REPORT
   fi
   section_footer
 
-  section_header "Screenshots" "$screenshot_count"
-  if [ -d "$dir/screenshots" ] && [ "$screenshot_count" -gt 0 ]; then
-    printf >&3 '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;padding:12px">\n'
-    for img in "$dir/screenshots/"*.jpeg; do
-      [ -f "$img" ] || continue
-      local img_name
-      img_name=$(basename "$img" .jpeg)
-      local escaped_img
-      escaped_img=$(printf '%s' "$img_name" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      printf >&3 '<div style="border:1px solid #30363d;border-radius:8px;overflow:hidden;background:#1c2128"><div style="padding:8px 12px;font-size:12px;border-bottom:1px solid #30363d;color:#8b949e">%s</div><a href="screenshots/%s.jpeg" target="_blank"><img src="screenshots/%s.jpeg" style="width:100%%;display:block" loading="lazy"></a></div>\n' "$escaped_img" "$img_name" "$img_name"
-    done
-    printf >&3 '</div>\n'
-  else
-    printf >&3 '<div class="empty-state">No screenshots taken</div>\n'
-  fi
-  section_footer
-
-  section_header "XSS Findings" "$xss_count"
-  if [ -f "$dir/xss_results.txt" ] && [ -s "$dir/xss_results.txt" ]; then
-    printf >&3 '<table>\n'
-    while IFS= read -r line || [ -n "$line" ]; do
-      [ -z "$line" ] && continue
-      local escaped
-      escaped=$(printf '%s' "$line" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      printf >&3 '<tr><td style="color:#d29922;font-size:12px">%s</td></tr>\n' "$escaped"
-    done < "$dir/xss_results.txt"
-    printf >&3 '</table>\n'
-  else
-    printf >&3 '<div class="empty-state">No XSS vulnerabilities found</div>\n'
-  fi
-  section_footer
-
   section_header "JavaScript Files" "$js_all_count"
   if [ -f "$dir/all_js.txt" ] && [ -s "$dir/all_js.txt" ]; then
     printf >&3 '<table>\n'
@@ -781,8 +709,6 @@ echo -e "JS Files       : $([ -f "$js" ] && wc -l <"$js" || echo 0)"
 echo -e "All JS Files   : $([ -f "$js_all" ] && wc -l <"$js_all" || echo 0)"
 echo -e "Katana URLs    : $([ -f "$outdir/katana_urls.txt" ] && wc -l <"$outdir/katana_urls.txt" || echo 0)"
 echo -e "Open Ports     : $([ -f "$ports" ] && wc -l <"$ports" || echo 0)"
-echo -e "Screenshots    : $(ls "$outdir/screenshots/"*.jpeg 2>/dev/null | wc -l)"
-echo -e "XSS Findings   : $([ -f "$outdir/xss_results.txt" ] && wc -l <"$outdir/xss_results.txt" || echo 0)"
 echo -e "Resolved Subs  : $([ -f "$resolved" ] && wc -l <"$resolved" || echo 0)"
 if [ -n "$PROXY" ]; then
   echo -e "Proxy         : $PROXY"
