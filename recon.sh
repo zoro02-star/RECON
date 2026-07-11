@@ -35,12 +35,15 @@ ${YELLOW}USAGE:${NC}
 
 ${YELLOW}OPTIONS:${NC}
    --help, -h              Show this help menu
-  --skip-scope            Skip scope broadening (ASN/whois)
-  --skip-nuclei           Skip Nuclei vulnerability scan
-  --skip-jsleaks          Skip Mantra JS secret scan
-  --skip-katana           Skip Katana crawl (JS, params extraction)
-  --proxy                 Proxy URL (e.g., http://localhost:8080 for Caido)
-  --rate, -c             Requests per second (e.g., -c 5 for 5 req/sec)
+   --skip-scope            Skip scope broadening (ASN/whois)
+   --skip-nuclei           Skip Nuclei vulnerability scan
+   --skip-jsleaks          Skip Mantra JS secret scan
+   --skip-katana           Skip Katana crawl (JS, params extraction)
+   --skip-permutations     Skip subdomain permutations (alterx + puredns)
+   --perms-limit           Max permutations to resolve (default: 50000)
+   --cookie, -ck           Cookie for authenticated recon (e.g., "session=abc123; token=xyz")
+   --proxy                 Proxy URL (e.g., http://localhost:8080 for Caido)
+   --rate, -c             Requests per second (e.g., -c 5 for 5 req/sec)
 
 ${YELLOW}EXAMPLES:${NC}
   $0 example.com
@@ -49,18 +52,21 @@ ${YELLOW}EXAMPLES:${NC}
   $0 example.com --proxy http://127.0.0.1:8080 --skip-nuclei
   $0 example.com -c 5
   $0 example.com -c 10 --proxy http://localhost:8080
+  $0 example.com --cookie "session=abc123; token=xyz"
+  $0 example.com --cookie "session=abc123" --proxy http://localhost:8080
 
 ${YELLOW}DESCRIPTION:${NC}
   This script automates the reconnaissance process for a given target domain.
   It performs the following steps in order:
     0. Scope Broadening (ASN/whois discovery)
     1. Subdomain Enumeration (subfinder, assetfinder, amass, chaos)
-    2. Live Host Detection (httpx)
-     3. Katana Crawl (deep URL/JS/params discovery)
-      4. Mantra JS Secret Scan (API key leak detection)
-      5. Port Scanning (naabu)
-      6. Vulnerability Scanning (nuclei)
-      7. Subdomain Permutations (alterx + puredns)
+    2. Live Host Detection + Tech Stack (httpx single pass)
+    3. Katana Crawl (deep URL/JS/params discovery)
+    3b. Extract API, Secrets, Admin Panels, Debug Endpoints
+    4. Mantra JS Secret Scan (API key leak detection)
+    4b. Nuclei Recommendations (based on recon data)
+    5. Vulnerability Scanning (nuclei)
+    6. Subdomain Permutations (alterx + puredns)
   All results are saved in a directory named after the target domain.
   Skipped steps will not be executed, and their output files will not be created.
 
@@ -76,8 +82,11 @@ SKIP_NUCLEI=false
 SKIP_JSLEAKS=false
 SKIP_SCOPE=false
 SKIP_KATANA=false
+SKIP_PERMS=false
+PERMS_LIMIT=50000
 PROXY=""
 RATE=""
+COOKIE=""
 
 # First non-flag argument must be the domain
 if [ $# -lt 1 ]; then
@@ -110,6 +119,17 @@ while [[ $# -gt 0 ]]; do
     --skip-katana)
       SKIP_KATANA=true
       ;;
+    --skip-permutations)
+      SKIP_PERMS=true
+      ;;
+    --perms-limit)
+      PERMS_LIMIT="$2"
+      shift
+      ;;
+    --cookie|-ck)
+      COOKIE="$2"
+      shift
+      ;;
     --proxy)
       PROXY="$2"
       shift
@@ -133,6 +153,10 @@ fi
 
 if [ -n "$RATE" ]; then
   echo -e "${BLUE}[*] Rate limit: $RATE req/sec${NC}"
+fi
+
+if [ -n "$COOKIE" ]; then
+  echo -e "${BLUE}[*] Using cookie for authenticated recon${NC}"
 fi
 
 ############################
@@ -247,35 +271,36 @@ if [ ! -f "$done_dir/subs.done" ]; then
 fi
 
 ############################
-# 2. Live Hosts
+# 2. Live Hosts + Tech Detection (single pass)
 ############################
 if [ ! -f "$done_dir/live.done" ]; then
-  echo -e "${BLUE}[*] Checking live hosts${NC}"
-  httpx_opts=( -silent -threads 50 -retries 1 )
+  echo -e "${BLUE}[*] Checking live hosts + tech detection${NC}"
+  httpx_opts=( -silent -td -threads 50 -retries 1 )
   if [ -n "$PROXY" ]; then
     httpx_opts+=( -proxy "$PROXY" )
   fi
   if [ -n "$RATE" ]; then
     httpx_opts+=( -rl "$RATE" )
   fi
-  cat "$subs" | httpx "${httpx_opts[@]}" | anew "$live"
-  echo -e "${GREEN}[+] Live hosts: $(wc -l <"$live")${NC}"
-  mkdir -p "$done_dir" && touch "$done_dir/live.done"
-fi
-
-############################
-# 2b. Tech Stack Detection
-############################
-if [ ! -f "$done_dir/tech.done" ]; then
-  echo -e "${BLUE}[*] Detecting technology stacks${NC}"
-  if [ -f "$live" ] && [ -s "$live" ]; then
-    cat "$live" | httpx -silent -td 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^\(https\?:\/\/[^ ]*\) \[\(.*\)\]$/\1: \2/' > "$tech_file" || true
-    echo -e "${GREEN}[+] Tech stack detected for $(wc -l <"$tech_file") hosts${NC}"
-  else
-    echo -e "${YELLOW}[!] No live hosts to scan for tech${NC}"
-    touch "$tech_file"
+  if [ -n "$COOKIE" ]; then
+    httpx_opts+=( -H "Cookie: $COOKIE" )
   fi
-  mkdir -p "$done_dir" && touch "$done_dir/tech.done"
+  tmp_httpx="$outdir/.httpx_combined.tmp"
+  cat "$subs" | httpx "${httpx_opts[@]}" | sed 's/\x1b\[[0-9;]*m//g' > "$tmp_httpx" || true
+
+  # Extract live hosts (URL before the tech brackets)
+  sed 's/ \[.*$//' "$tmp_httpx" | anew "$live" || true
+
+  # Extract tech info (URL: tech) — only lines where tech was actually detected
+  sed 's/^\(https\?:\/\/[^ ]*\) \[\(.*\)\]$/\1: \2/' "$tmp_httpx" | grep -v ': *$' | grep -v '^\S*$' > "$tech_file" || true
+
+  rm -f "$tmp_httpx"
+
+  echo -e "${GREEN}[+] Live hosts: $(wc -l <"$live" 2>/dev/null || echo 0)${NC}"
+  echo -e "${GREEN}[+] Tech stack: $(wc -l <"$tech_file" 2>/dev/null || echo 0) hosts${NC}"
+  mkdir -p "$done_dir" && touch "$done_dir/live.done" && touch "$done_dir/tech.done"
+else
+  echo -e "${YELLOW}[*] Skipping live host + tech detection (already done)${NC}"
 fi
 
 ############################
@@ -290,9 +315,14 @@ if [ "$SKIP_KATANA" = false ]; then
       -jc -jsluice
       -ef woff,css,svg,png,jpg,gif
       -silent
-      -c 3                          # max 3 concurrent crawls
-      -p 50                         # max 50 pages per host
-      -ct 15                        # 15s request timeout
+      -c 5                          # max 5 concurrent fetchers
+      -p 10                         # max 10 concurrent host inputs
+      -mdp 200                      # max 200 pages per domain
+      -iqp                          # ignore different query-param values (dedup)
+      -fsu                          # filter similar-looking URLs (e.g. /user/123 vs /user/456)
+      -fpt error,captcha,parked     # skip error/captcha/parked pages
+      -hrl 10                       # max 10 requests/sec per host
+      -ct 10                        # 10s request timeout
       -o "$outdir/katana_urls.txt"
     )
     if [ -n "$PROXY" ]; then
@@ -300,6 +330,9 @@ if [ "$SKIP_KATANA" = false ]; then
     fi
     if [ -n "$RATE" ]; then
       katana_opts+=( -rl "$RATE" )
+    fi
+    if [ -n "$COOKIE" ]; then
+      katana_opts+=( -H "Cookie: $COOKIE" )
     fi
     katana "${katana_opts[@]}"
     echo -e "${GREEN}[+] Katana URLs: $(wc -l <"$outdir/katana_urls.txt" 2>/dev/null || echo 0)${NC}"
@@ -310,20 +343,62 @@ else
 fi
 
 ############################
-# 3b. Extract JS & Params from Katana
+# 3b. Extract JS, API, Secrets, Params from Katana
 ############################
 js="$outdir/jsfiles.txt"
 js_all="$outdir/all_js.txt"
 if [ -f "$outdir/katana_urls.txt" ] && [ -s "$outdir/katana_urls.txt" ]; then
+
   echo -e "${YELLOW}[*] Extracting JS files from katana crawl${NC}"
-  grep -E ".*\.js($|\\?.*)" "$outdir/katana_urls.txt" | anew "$js_all" || true
+  grep -Ei "\.js($|\?|#)" "$outdir/katana_urls.txt" \
+    | sed 's/[?#].*//' \
+    | sort -u \
+    > "$js_all" || true
   cp "$js_all" "$js" 2>/dev/null || true
-  echo -e "${YELLOW}[*] Extracting URLs with query parameters from katana${NC}"
+  echo -e "${GREEN}[+] JS files: $(wc -l <"$js_all" 2>/dev/null || echo 0)${NC}"
+
+  echo -e "${YELLOW}[*] Extracting API endpoints${NC}"
+  grep -Ei "/(api|graphql|rest|soap|v[0-9]+|swagger|openapi|docs|documentation)" "$outdir/katana_urls.txt" \
+    | sort -u > "$outdir/api_endpoints.txt" || true
+  echo -e "${GREEN}[+] API endpoints: $(wc -l <"$outdir/api_endpoints.txt" 2>/dev/null || echo 0)${NC}"
+
+  echo -e "${YELLOW}[*] Extracting sensitive / secret files${NC}"
+  grep -Ei "\.(env|git|htaccess|htpasswd|sql|bak|backup|config|cfg|ini|log|key|pem|crt|p12|jks|keystore|yaml|yml|toml|xml|json|properties|csv|xls|xlsx|doc|docx|ppt|pptx)(\?|$|#)" "$outdir/katana_urls.txt" \
+    | sort -u > "$outdir/secret_files.txt" || true
+  grep -Ei "(wp-config|\.ssh|\.aws|\.docker|\.env\.|credentials|secret|private|token)" "$outdir/katana_urls.txt" \
+    | sort -u >> "$outdir/secret_files.txt" || true
+  sort -u -o "$outdir/secret_files.txt" "$outdir/secret_files.txt" || true
+  echo -e "${GREEN}[+] Secret files: $(wc -l <"$outdir/secret_files.txt" 2>/dev/null || echo 0)${NC}"
+
+  echo -e "${YELLOW}[*] Extracting admin / dashboard panels${NC}"
+  grep -Ei "/(admin|dashboard|panel|manage|console|portal|wp-admin|cpanel|phpmyadmin|adminer|manager)" "$outdir/katana_urls.txt" \
+    | sort -u > "$outdir/admin_panels.txt" || true
+  echo -e "${GREEN}[+] Admin panels: $(wc -l <"$outdir/admin_panels.txt" 2>/dev/null || echo 0)${NC}"
+
+  echo -e "${YELLOW}[*] Extracting debug / health endpoints${NC}"
+  grep -Ei "/(debug|actuator|health|metrics|trace|status|info|server-status|server-info|_debug|phpinfo|elmah|trace.axd)" "$outdir/katana_urls.txt" \
+    | sort -u > "$outdir/debug_endpoints.txt" || true
+  echo -e "${GREEN}[+] Debug endpoints: $(wc -l <"$outdir/debug_endpoints.txt" 2>/dev/null || echo 0)${NC}"
+
+  echo -e "${YELLOW}[*] Extracting interesting parameters (SSRF/IDOR/redirect)${NC}"
+  grep -Ei "[?&](url|redirect|next|return|go|redir|callback|uri|path|file|document|folder|pg|data|load|src|dest|continue|target|link|image|img|ref|site|page|cmd|command|exec|eval|query|search|q|id|uid|user|account|token|key|session|debug|admin|test|env|config)" "$outdir/katana_urls.txt" \
+    | sort -u > "$outdir/interesting_params.txt" || true
+  echo -e "${GREEN}[+] Interesting params: $(wc -l <"$outdir/interesting_params.txt" 2>/dev/null || echo 0)${NC}"
+
+  echo -e "${YELLOW}[*] Extracting documents & data files${NC}"
+  grep -Ei "\.(pdf|csv|xls|xlsx|doc|docx|ppt|pptx|txt|rtf|odt|ods|xml|json|yaml|yml)(\?|$|#)" "$outdir/katana_urls.txt" \
+    | sort -u > "$outdir/documents.txt" || true
+  echo -e "${GREEN}[+] Documents: $(wc -l <"$outdir/documents.txt" 2>/dev/null || echo 0)${NC}"
+
+  echo -e "${YELLOW}[*] Extracting URLs with query parameters${NC}"
   grep "=" "$outdir/katana_urls.txt" | anew "$outdir/katana_params.txt" || true
-  echo -e "${GREEN}[+] Total JS files: $(wc -l <"$js_all" 2>/dev/null || echo 0)${NC}"
+
 else
   echo -e "${YELLOW}[!] No katana URLs to filter${NC}"
   touch "$js_all" "$js"
+  touch "$outdir/api_endpoints.txt" "$outdir/secret_files.txt" "$outdir/admin_panels.txt"
+  touch "$outdir/debug_endpoints.txt" "$outdir/interesting_params.txt" "$outdir/documents.txt"
+  touch "$outdir/katana_params.txt"
 fi
 
 ############################
@@ -335,16 +410,165 @@ if [ "$SKIP_JSLEAKS" = false ] && [ ! -f "$done_dir/mantra.done" ]; then
     js_scan_file="$js"
   fi
   if [ -f "$js_scan_file" ] && [ -s "$js_scan_file" ]; then
-    echo -e "${YELLOW}[*] Running Mantra API key scan on JS files${NC}"
-    if [ -n "$RATE" ]; then
-      cat "$js_scan_file" | mantra -s -t "$RATE" | anew "$mantra_out" || true
-    else
-      cat "$js_scan_file" | mantra -s | anew "$mantra_out" || true
+    js_count=$(wc -l <"$js_scan_file")
+    # Cap JS input to 500 files to avoid mantra hanging on huge lists
+    if [ "$js_count" -gt 500 ]; then
+      echo -e "${YELLOW}[!] $js_count JS files — capping to 500 for mantra${NC}"
+      head -500 "$js_scan_file" > "$outdir/_mantra_input.txt"
+      js_scan_file="$outdir/_mantra_input.txt"
     fi
+    mantra_threads=20
+    [ -n "$RATE" ] && mantra_threads="$RATE"
+    mantra_opts=( -s -t "$mantra_threads" )
+    if [ -n "$COOKIE" ]; then
+      mantra_opts+=( -c "$COOKIE" )
+    fi
+    echo -e "${YELLOW}[*] Running Mantra API key scan on JS files (threads: $mantra_threads)${NC}"
+    cat "$js_scan_file" | mantra "${mantra_opts[@]}" | anew "$mantra_out" || true
+    rm -f "$outdir/_mantra_input.txt"
     echo -e "${GREEN}[+] Mantra scan complete: $(wc -l <"$mantra_out" 2>/dev/null || echo 0) findings${NC}"
     mkdir -p "$done_dir" && touch "$done_dir/mantra.done"
   fi
 fi
+
+############################
+# 4b. Nuclei Recommendations (based on recon data)
+############################
+echo -e "\n${YELLOW}[*] Analyzing recon data for nuclei recommendations...${NC}"
+recommendations_file="$outdir/nuclei_recommendations.txt"
+: > "$recommendations_file"
+
+tech_recs="" 
+admin_recs=""
+debug_recs=""
+api_recs=""
+secret_recs=""
+param_recs=""
+
+# Detect tech stack and recommend templates
+if [ -f "$tech_file" ] && [ -s "$tech_file" ]; then
+  tech_data=$(cat "$tech_file" | tr '[:upper:]' '[:lower:]')
+  echo "$tech_data" | grep -qi "apache"   && tech_recs="${tech_recs}  -tags apache\n"
+  echo "$tech_data" | grep -qi "nginx"    && tech_recs="${tech_recs}  -tags nginx\n"
+  echo "$tech_data" | grep -qi "iis"      && tech_recs="${tech_recs}  -tags iis\n"
+  echo "$tech_data" | grep -qi "tomcat"   && tech_recs="${tech_recs}  -tags tomcat\n"
+  echo "$tech_data" | grep -qi "php"      && tech_recs="${tech_recs}  -tags php\n"
+  echo "$tech_data" | grep -qi "asp"      && tech_recs="${tech_recs}  -tags asp\n"
+  echo "$tech_data" | grep -qi "java"     && tech_recs="${tech_recs}  -tags java\n"
+  echo "$tech_data" | grep -qi "spring"   && tech_recs="${tech_recs}  -tags spring\n"
+  echo "$tech_data" | grep -qi "express"  && tech_recs="${tech_recs}  -tags express\n"
+  echo "$tech_data" | grep -qi "django"   && tech_recs="${tech_recs}  -tags django\n"
+  echo "$tech_data" | grep -qi "laravel"  && tech_recs="${tech_recs}  -tags laravel\n"
+  echo "$tech_data" | grep -qi "wordpress" && tech_recs="${tech_recs}  -tags wordpress\n"
+  echo "$tech_data" | grep -qi "drupal"   && tech_recs="${tech_recs}  -tags drupal\n"
+  echo "$tech_data" | grep -qi "joomla"   && tech_recs="${tech_recs}  -tags joomla\n"
+  echo "$tech_data" | grep -qi "jenkins"  && tech_recs="${tech_recs}  -tags jenkins\n"
+  echo "$tech_data" | grep -qi "gitlab"   && tech_recs="${tech_recs}  -tags gitlab\n"
+  echo "$tech_data" | grep -qi "grafana"  && tech_recs="${tech_recs}  -tags grafana\n"
+  echo "$tech_data" | grep -qi "kibana"   && tech_recs="${tech_recs}  -tags kibana\n"
+  echo "$tech_data" | grep -qi "kong"     && tech_recs="${tech_recs}  -tags kong\n"
+  echo "$tech_data" | grep -qi "cloudflare" && tech_recs="${tech_recs}  -tags cloudflare\n"
+  echo "$tech_data" | grep -qi "akamai"   && tech_recs="${tech_recs}  -tags akamai\n"
+  echo "$tech_data" | grep -qi "fastly"   && tech_recs="${tech_recs}  -tags fastly\n"
+fi
+
+# Check admin panels
+if [ -f "$outdir/admin_panels.txt" ] && [ -s "$outdir/admin_panels.txt" ]; then
+  admin_recs="  -tags default-login,admin\n  -tags panel\n"
+fi
+
+# Check debug endpoints
+if [ -f "$outdir/debug_endpoints.txt" ] && [ -s "$outdir/debug_endpoints.txt" ]; then
+  debug_recs="  -tags debug,exposure\n  -tags phpinfo,actuator\n"
+fi
+
+# Check API endpoints
+if [ -f "$outdir/api_endpoints.txt" ] && [ -s "$outdir/api_endpoints.txt" ]; then
+  api_recs="  -tags graphql\n  -tags swagger,openapi\n  -tags api\n"
+fi
+
+# Check secret files
+if [ -f "$outdir/secret_files.txt" ] && [ -s "$outdir/secret_files.txt" ]; then
+  secret_recs="  -tags exposure,config\n  -tags .env,git\n"
+fi
+
+# Check interesting params
+if [ -f "$outdir/interesting_params.txt" ] && [ -s "$outdir/interesting_params.txt" ]; then
+  param_recs="  -tags ssrf\n  -tags redirect\n  -tags lfi\n"
+fi
+
+# Check live host count for brute force templates
+live_count=0
+[ -f "$live" ] && live_count=$(wc -l <"$live" 2>/dev/null || echo 0)
+
+# Build recommendations file
+{
+  echo "=============================================="
+  echo " Nuclei Recommendations for $domain"
+  echo " Generated: $(date '+%Y-%m-%d %H:%M')"
+  echo "=============================================="
+  echo ""
+
+  if [ -n "$tech_recs" ]; then
+    echo "## Tech-specific templates (from tech stack)"
+    echo "nuclei -l $live -tags <tech> -silent"
+    echo -e "$tech_recs"
+  fi
+
+  if [ -n "$admin_recs" ]; then
+    echo "## Admin panel / default login checks"
+    echo "nuclei -l $live -silent"
+    echo -e "$admin_recs"
+  fi
+
+  if [ -n "$debug_recs" ]; then
+    echo "## Debug / info exposure"
+    echo "nuclei -l $live -silent"
+    echo -e "$debug_recs"
+  fi
+
+  if [ -n "$api_recs" ]; then
+    echo "## API-specific checks"
+    echo "nuclei -l $live -silent"
+    echo -e "$api_recs"
+  fi
+
+  if [ -n "$secret_recs" ]; then
+    echo "## Secret / config file exposure"
+    echo "nuclei -l $live -silent"
+    echo -e "$secret_recs"
+  fi
+
+  if [ -n "$param_recs" ]; then
+    echo "## Parameter-based vuln checks (use with param URLs)"
+    echo "nuclei -l $outdir/interesting_params.txt -silent"
+    echo -e "$param_recs"
+  fi
+
+  echo "## Full aggressive scan (all of the above)"
+  if [ -n "$COOKIE" ]; then
+    echo "nuclei -l $live -severity critical,high,medium -silent -H \"Cookie: $COOKIE\""
+  else
+    echo "nuclei -l $live -severity critical,high,medium -silent"
+  fi
+  echo ""
+  echo "## Targeted scan on interesting params"
+  if [ -f "$outdir/interesting_params.txt" ] && [ -s "$outdir/interesting_params.txt" ]; then
+    if [ -n "$COOKIE" ]; then
+      echo "nuclei -l $outdir/interesting_params.txt -tags ssrf,redirect,lfi,rce -silent -H \"Cookie: $COOKIE\""
+    else
+      echo "nuclei -l $outdir/interesting_params.txt -tags ssrf,redirect,lfi,rce -silent"
+    fi
+  fi
+  echo ""
+  echo "=============================================="
+
+} > "$recommendations_file"
+
+echo -e "${GREEN}[+] Recommendations saved: $recommendations_file${NC}"
+echo -e "${BLUE}[*] === NUCLEI RECOMMENDATIONS ===${NC}"
+cat "$recommendations_file"
+echo -e "${BLUE}[*] =================================${NC}\n"
 
 ############################
 # 5. Nuclei Scan
@@ -358,6 +582,9 @@ if [ "$SKIP_NUCLEI" = false ]; then
     fi
     if [ -n "$RATE" ]; then
       nuclei_opts+=( -rl "$RATE" )
+    fi
+    if [ -n "$COOKIE" ]; then
+      nuclei_opts+=( -H "Cookie: $COOKIE" )
     fi
     nuclei -l "$live" "${nuclei_opts[@]}" -o "$nuclei_out"
     if grep -qiE "critical|high" "$nuclei_out" 2>/dev/null; then
@@ -374,15 +601,47 @@ fi
 # 6. Subdomain Permutations (alterx + puredns)
 ############################
 alt_file="$outdir/alterx_subs.txt"
-if [ ! -f "$done_dir/alterx.done" ]; then
+if [ "$SKIP_PERMS" = true ]; then
+  echo -e "${YELLOW}[*] Skipping subdomain permutations${NC}"
+  touch "$resolved"
+  mkdir -p "$done_dir" && touch "$done_dir/alterx.done"
+elif [ ! -f "$done_dir/alterx.done" ]; then
   echo -e "${BLUE}[*] Generating subdomain permutations with alterx${NC}"
-  if [ -f "$subs" ] && [ -s "$subs" ]; then
-    alterx -l "$subs" -silent -en 2>/dev/null | head -50000 > "$alt_file" || true
+
+  # Use live_hosts if available (much smaller), fall back to full subdomains
+  perm_input="$subs"
+  if [ -f "$live" ] && [ -s "$live" ]; then
+    # Extract hostnames from live_hosts.txt (strip scheme) for permutations
+    sed 's|https\?://||;s|/.*||' "$live" | sort -u > "$outdir/_perm_input.txt"
+    perm_input="$outdir/_perm_input.txt"
+    echo -e "${YELLOW}[*] Using $(wc -l <"$perm_input") live hostnames for permutations (faster)${NC}"
+  fi
+
+  src_count=$(wc -l <"$perm_input" 2>/dev/null || echo 0)
+  if [ "$src_count" -gt 0 ]; then
+    # If source is huge, cap it to avoid massive permutation explosion
+    effective_input="$perm_input"
+    if [ "$src_count" -gt 5000 ]; then
+      echo -e "${YELLOW}[!] $src_count input hosts — capping to 5000 for alterx${NC}"
+      shuf -n 5000 "$perm_input" > "$outdir/_perm_capped.txt"
+      effective_input="$outdir/_perm_capped.txt"
+    fi
+
+    alterx -l "$effective_input" -silent -en 2>/dev/null | head -"$PERMS_LIMIT" > "$alt_file" || true
+    rm -f "$outdir/_perm_input.txt" "$outdir/_perm_capped.txt"
+
     if [ -f "$alt_file" ] && [ -s "$alt_file" ]; then
-      echo -e "${GREEN}[+] alterx generated $(wc -l <"$alt_file") permutations${NC}"
+      perm_count=$(wc -l <"$alt_file")
+      echo -e "${GREEN}[+] alterx generated $perm_count permutations${NC}"
+
+      # If permutations exceed the limit, inform user
+      if [ "$perm_count" -ge "$PERMS_LIMIT" ]; then
+        echo -e "${YELLOW}[!] Hit the --perms-limit of $PERMS_LIMIT. Resolving in batches...${NC}"
+      fi
+
       echo -e "${BLUE}[*] Resolving with puredns${NC}"
       cat "$alt_file" | puredns resolve | anew "$resolved" || true
-      echo -e "${GREEN}[+] Resolved $(wc -l <"$resolved") new subdomains${NC}"
+      echo -e "${GREEN}[+] Resolved $(wc -l <"$resolved" 2>/dev/null || echo 0) new subdomains${NC}"
     else
       echo -e "${YELLOW}[!] alterx generated no permutations${NC}"
       touch "$resolved"
@@ -393,274 +652,6 @@ if [ ! -f "$done_dir/alterx.done" ]; then
   fi
   mkdir -p "$done_dir" && touch "$done_dir/alterx.done"
 fi
-
-############################
-# HTML Report
-############################
-generate_report() {
-  local dir="$1"
-  local report_file="$dir/report.html"
-  local domain
-  domain=$(basename "$dir")
-
-  local sub_count live_count scope_count nuclei_count mantra_count js_all_count katana_count params_count resolved_count
-  sub_count=$([ -f "$dir/subdomains.txt" ] && wc -l < "$dir/subdomains.txt" || echo 0)
-  live_count=$([ -f "$dir/live_hosts.txt" ] && wc -l < "$dir/live_hosts.txt" || echo 0)
-  scope_count=$([ -f "$dir/broad_scope.txt" ] && wc -l < "$dir/broad_scope.txt" || echo 0)
-  nuclei_count=$([ -f "$dir/nuclei_results.txt" ] && wc -l < "$dir/nuclei_results.txt" || echo 0)
-  mantra_count=$([ -f "$dir/mantra_results.txt" ] && wc -l < "$dir/mantra_results.txt" || echo 0)
-  js_all_count=$([ -f "$dir/all_js.txt" ] && wc -l < "$dir/all_js.txt" || echo 0)
-  katana_count=$([ -f "$dir/katana_urls.txt" ] && wc -l < "$dir/katana_urls.txt" || echo 0)
-  params_count=$([ -f "$dir/katana_params.txt" ] && wc -l < "$dir/katana_params.txt" || echo 0)
-  resolved_count=$([ -f "$dir/resolved_subs.txt" ] && wc -l < "$dir/resolved_subs.txt" || echo 0)
-
-  exec 3>"$report_file"
-
-  cat >&3 << REPORT
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Recon Report - $domain</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:#0d1117;color:#c9d1d9;padding:20px;font-size:14px;line-height:1.5}
-a{color:#58a6ff;text-decoration:none}
-a:hover{text-decoration:underline;color:#79c0ff}
-.report-header{max-width:1200px;margin:0 auto 24px}
-.report-header h1{font-size:28px;font-weight:600;color:#f0f6fc;margin-bottom:4px}
-.report-header .subtitle{color:#8b949e;font-size:14px}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin:0 auto 24px;max-width:1200px}
-.stat-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;text-align:center}
-.stat-card .num{font-size:24px;font-weight:700;color:#f0f6fc}
-.stat-card .label{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-top:4px}
-.search-bar{max-width:1200px;margin:0 auto 24px}
-.search-bar input{width:100%;padding:10px 14px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#c9d1d9;font-size:14px;outline:none;transition:border-color .2s}
-.search-bar input:focus{border-color:#58a6ff}
-.section{max-width:1200px;margin:0 auto 24px;background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}
-.section-header{padding:14px 18px;background:#1c2128;border-bottom:1px solid #30363d;display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none}
-.section-header:hover{background:#21262d}
-.section-header h2{font-size:15px;font-weight:600;color:#f0f6fc}
-.section-header .count{background:#30363d;color:#c9d1d9;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:500}
-.section-body{padding:0}
-.section-body table{width:100%;border-collapse:collapse}
-.section-body td{padding:8px 18px;border-bottom:1px solid #21262d;word-break:break-all;font-family:'SF Mono','Fira Code','Consolas',monospace;font-size:13px}
-.section-body tr:last-child td{border-bottom:none}
-.section-body tr:hover{background:#1c2128}
-.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600;text-transform:uppercase;margin-right:6px}
-.badge-critical{background:#da3633;color:#fff}
-.badge-high{background:#d29922;color:#fff}
-.badge-medium{background:#9e6a03;color:#fff}
-.badge-low{background:#1f6feb;color:#fff}
-.badge-info{background:#30363d;color:#c9d1d9}
-.badge-http{background:#1f6feb20;color:#58a6ff;border:1px solid #1f6feb40}
-.badge-https{background:#23863620;color:#3fb950;border:1px solid #23863640}
-.empty-state{padding:32px 18px;text-align:center;color:#8b949e;font-size:13px}
-.secret-finding{color:#f0883e}
-.nuclei-line{font-family:'SF Mono','Fira Code','Consolas',monospace;font-size:12px;padding:4px 0}
-.param-url{color:#d2a8ff}
-.tech-cell{display:flex;flex-wrap:wrap;gap:4px}
-.tech-badge{display:inline-block;padding:1px 7px;border-radius:4px;font-size:10px;font-weight:600;background:#1c2128;border:1px solid #30363d;color:#8b949e}
-.tech-badge:nth-child(6n+1){border-color:#da363340;color:#f85149}
-.tech-badge:nth-child(6n+2){border-color:#d2992240;color:#d29922}
-.tech-badge:nth-child(6n+3){border-color:#1f6feb40;color:#58a6ff}
-.tech-badge:nth-child(6n+4){border-color:#23863640;color:#3fb950}
-.tech-badge:nth-child(6n+5){border-color:#bc8cff40;color:#bc8cff}
-.tech-badge:nth-child(6n+6){border-color:#f0883e40;color:#f0883e}
-.notice{padding:10px 18px;background:#1c2128;border-top:1px solid #30363d;text-align:center;color:#8b949e;font-size:12px}
-@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}
-</style>
-</head>
-<body>
-REPORT
-
-  printf >&3 '\n<div class="report-header"><h1>Recon Report: <span style="color:#58a6ff">%s</span></h1><div class="subtitle">Generated %s</div></div>\n' "$domain" "$(date '+%Y-%m-%d %H:%M')"
-
-  printf >&3 '\n<div class="stats">'
-  printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Subdomains</div></div>' "$sub_count"
-  printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Live Hosts</div></div>' "$live_count"
-  [ "$scope_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Scope CIDRs</div></div>' "$scope_count" || true
-  [ "$resolved_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Resolved Subs</div></div>' "$resolved_count" || true
-  [ "$nuclei_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num" style="color:#da3633">%s</div><div class="label">Nuclei Findings</div></div>' "$nuclei_count" || true
-  [ "$mantra_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num" style="color:#f0883e">%s</div><div class="label">Secrets</div></div>' "$mantra_count" || true
-  [ "$katana_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">Crawled URLs</div></div>' "$katana_count" || true
-  [ "$params_count" -gt 0 ] 2>/dev/null && printf >&3 '\n<div class="stat-card"><div class="num">%s</div><div class="label">URLs w/ Params</div></div>' "$params_count" || true
-  printf >&3 '\n</div>'
-
-  cat >&3 << 'REPORT'
-<div class="search-bar"><input type="text" id="searchInput" placeholder="Filter across all sections..." onkeyup="filterAll()"></div>
-REPORT
-
-  html_row() { printf >&3 '    <tr><td>%s</td></tr>\n' "$1"; }
-
-  section_header() { printf >&3 '\n<div class="section"><div class="section-header" onclick="toggleBody(this)"><h2>%s</h2><span class="count">%s</span></div><div class="section-body">\n' "$1" "$2"; }
-  section_footer() { printf >&3 '</div></div>\n'; }
-
-  section_header "Live Subdomains" "$live_count"
-  if [ -f "$dir/live_hosts.txt" ] && [ -s "$dir/live_hosts.txt" ]; then
-    printf >&3 '<table>\n'
-    while IFS= read -r host || [ -n "$host" ]; do
-      [ -z "$host" ] && continue
-      local scheme_class="badge-https"
-      case "$host" in http://*) scheme_class="badge-http" ;; esac
-      local escaped
-      escaped=$(printf '%s' "$host" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      local display
-      display=$(printf '%s' "$host" | sed 's|https://||;s|http://||')
-      local tech_line tech
-      tech_line=""
-      [ -f "$dir/tech_stack.txt" ] && tech_line=$(grep -F "$host:" "$dir/tech_stack.txt" 2>/dev/null || true)
-      if [ -n "$tech_line" ]; then
-        tech=$(printf '%s' "$tech_line" | cut -d' ' -f2-)
-        local tech_html=""
-        local IFS=,
-        for t in $tech; do
-          t=$(printf '%s' "$t" | sed 's/^ *//;s/ *$//;s/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g;s/"/\&quot;/g')
-          tech_html="$tech_html<span class=\"tech-badge\">$t</span>"
-        done
-        unset IFS
-        printf >&3 '<tr><td style="width:60%%"><a href="%s" target="_blank" rel="noopener"><span class="badge %s">%s</span>%s</a></td><td style="width:40%%"><div class="tech-cell">%s</div></td></tr>\n' "$escaped" "$scheme_class" "$(printf '%s' "$host" | grep -q '^http://' && echo 'HTTP' || echo 'HTTPS')" "$display" "$tech_html"
-      else
-        printf >&3 '<tr><td><a href="%s" target="_blank" rel="noopener"><span class="badge %s">%s</span>%s</a></td><td></td></tr>\n' "$escaped" "$scheme_class" "$(printf '%s' "$host" | grep -q '^http://' && echo 'HTTP' || echo 'HTTPS')" "$display"
-      fi
-    done < "$dir/live_hosts.txt"
-    printf >&3 '</table>\n'
-  else
-    printf >&3 '<div class="empty-state">No live hosts found</div>\n'
-  fi
-  section_footer
-
-  section_header "Scope (CIDR Ranges)" "$scope_count"
-  if [ -f "$dir/cidr_ranges.txt" ] && [ -s "$dir/cidr_ranges.txt" ]; then
-    printf >&3 '<table>\n'
-    while IFS= read -r line || [ -n "$line" ]; do
-      [ -z "$line" ] && continue
-      local escaped
-      escaped=$(printf '%s' "$line" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      printf >&3 '<tr><td><span class="badge badge-info">CIDR</span>%s</td></tr>\n' "$escaped"
-    done < "$dir/cidr_ranges.txt"
-    printf >&3 '</table>\n'
-  else
-    printf >&3 '<div class="empty-state">No CIDR ranges discovered</div>\n'
-  fi
-  section_footer
-
-  cat >&3 << 'REPORT'
-<div class="section"><div class="section-header" onclick="toggleBody(this)"><h2>Potentially Vulnerable URLs</h2><span class="count">VULNS</span></div><div class="section-body">
-REPORT
-
-  if [ -f "$dir/katana_params.txt" ] && [ -s "$dir/katana_params.txt" ]; then
-    printf >&3 '<div style="padding:10px 18px;background:#1c2128;border-bottom:1px solid #30363d;font-size:13px;font-weight:600;color:#d2a8ff">URLs with Query Parameters (%s)</div>\n' "$params_count"
-    printf >&3 '<table>\n'
-    local pcount=0
-    while IFS= read -r url || [ -n "$url" ]; do
-      [ -z "$url" ] && continue
-      pcount=$((pcount + 1))
-      [ "$pcount" -gt 200 ] && continue
-      local escaped
-      escaped=$(printf '%s' "$url" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      printf >&3 '<tr><td class="param-url"><a href="%s" target="_blank" rel="noopener">%s</a></td></tr>\n' "$escaped" "$escaped"
-    done < "$dir/katana_params.txt"
-    printf >&3 '</table>\n'
-    [ "$params_count" -gt 200 ] && printf >&3 '<div class="notice">Showing 200 of %s entries</div>\n' "$params_count"
-  fi
-
-  if [ -f "$dir/nuclei_results.txt" ] && [ -s "$dir/nuclei_results.txt" ]; then
-    printf >&3 '<div style="padding:10px 18px;background:#1c2128;border-bottom:1px solid #30363d;font-size:13px;font-weight:600;color:#da3633">Nuclei Findings (%s)</div>\n' "$nuclei_count"
-    printf >&3 '<table>\n'
-    while IFS= read -r line || [ -n "$line" ]; do
-      [ -z "$line" ] && continue
-      local escaped line_lower severity badge
-      escaped=$(printf '%s' "$line" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      line_lower=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
-      severity="info"
-      case "$line_lower" in *critical*) severity="critical"; badge="badge-critical" ;; *high*) severity="high"; badge="badge-high" ;; *medium*) severity="medium"; badge="badge-medium" ;; *low*) severity="low"; badge="badge-low" ;; *) severity="info"; badge="badge-info" ;; esac
-      printf >&3 '<tr><td><span class="badge %s">%s</span><span class="nuclei-line">%s</span></td></tr>\n' "$badge" "$severity" "$escaped"
-    done < "$dir/nuclei_results.txt"
-    printf >&3 '</table>\n'
-  fi
-
-  if [ -f "$dir/mantra_results.txt" ] && [ -s "$dir/mantra_results.txt" ]; then
-    printf >&3 '<div style="padding:10px 18px;background:#1c2128;border-bottom:1px solid #30363d;font-size:13px;font-weight:600;color:#f0883e">Mantra Secrets (%s)</div>\n' "$mantra_count"
-    printf >&3 '<table>\n'
-    while IFS= read -r line || [ -n "$line" ]; do
-      [ -z "$line" ] && continue
-      local cleaned
-      cleaned=$(printf '%s' "$line" | sed 's/\x1b\[[0-9;]*m//g; s/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      printf >&3 '<tr><td class="secret-finding">%s</td></tr>\n' "$cleaned"
-    done < "$dir/mantra_results.txt"
-    printf >&3 '</table>\n'
-  fi
-
-  if { [ ! -f "$dir/katana_params.txt" ] || [ ! -s "$dir/katana_params.txt" ]; } && { [ ! -f "$dir/nuclei_results.txt" ] || [ ! -s "$dir/nuclei_results.txt" ]; } && { [ ! -f "$dir/mantra_results.txt" ] || [ ! -s "$dir/mantra_results.txt" ]; }; then
-    printf >&3 '<div class="empty-state">No potentially vulnerable URLs found</div>\n'
-  fi
-  section_footer
-
-  section_header "JavaScript Files" "$js_all_count"
-  if [ -f "$dir/all_js.txt" ] && [ -s "$dir/all_js.txt" ]; then
-    printf >&3 '<table>\n'
-    while IFS= read -r url || [ -n "$url" ]; do
-      [ -z "$url" ] && continue
-      local escaped
-      escaped=$(printf '%s' "$url" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      printf >&3 '<tr><td><a href="%s" target="_blank" rel="noopener">%s</a></td></tr>\n' "$escaped" "$escaped"
-    done < "$dir/all_js.txt"
-    printf >&3 '</table>\n'
-  else
-    printf >&3 '<div class="empty-state">No JS files found</div>\n'
-  fi
-  section_footer
-
-  section_header "Katana Crawl Results" "$katana_count"
-  if [ -f "$dir/katana_urls.txt" ] && [ -s "$dir/katana_urls.txt" ]; then
-    printf >&3 '<table>\n'
-    local kcount=0
-    while IFS= read -r url || [ -n "$url" ]; do
-      [ -z "$url" ] && continue
-      kcount=$((kcount + 1))
-      [ "$kcount" -gt 500 ] && continue
-      local escaped
-      escaped=$(printf '%s' "$url" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      printf >&3 '<tr><td><a href="%s" target="_blank" rel="noopener">%s</a></td></tr>\n' "$escaped" "$escaped"
-    done < "$dir/katana_urls.txt"
-    printf >&3 '</table>\n'
-    [ "$katana_count" -gt 500 ] && printf >&3 '<div class="notice">Showing 500 of %s entries</div>\n' "$katana_count"
-  else
-    printf >&3 '<div class="empty-state">No katana URLs found</div>\n'
-  fi
-  section_footer
-
-  section_header "Resolved Subdomains (alterx + puredns)" "$resolved_count"
-  if [ -f "$dir/resolved_subs.txt" ] && [ -s "$dir/resolved_subs.txt" ]; then
-    printf >&3 '<table>\n'
-    while IFS= read -r host || [ -n "$host" ]; do
-      [ -z "$host" ] && continue
-      local escaped
-      escaped=$(printf '%s' "$host" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
-      printf >&3 '<tr><td><a href="http://%s" target="_blank" rel="noopener">%s</a></td></tr>\n' "$escaped" "$escaped"
-    done < "$dir/resolved_subs.txt"
-    printf >&3 '</table>\n'
-  else
-    printf >&3 '<div class="empty-state">No resolved subdomains found</div>\n'
-  fi
-  section_footer
-
-  cat >&3 << 'REPORT'
-<script>
-function toggleBody(header){var body=header.nextElementSibling;if(body.style.display==='none'){body.style.display=''}else{body.style.display='none'}}
-function filterAll(){var input=document.getElementById('searchInput');var filter=input.value.toUpperCase();var sections=document.querySelectorAll('.section');for(var i=0;i<sections.length;i++){var section=sections[i];var body=section.querySelector('.section-body');var rows=body?body.querySelectorAll('tr'):[];var hasMatch=false;for(var j=0;j<rows.length;j++){var text=rows[j].textContent||rows[j].innerText;if(text.toUpperCase().indexOf(filter)>-1){rows[j].style.display='';hasMatch=true}else{rows[j].style.display='none'}}if(body&&rows.length===0){continue}var header=section.querySelector('.section-header');if(hasMatch){section.style.display=''}else{section.style.display='none'}}}
-</script>
-</body>
-</html>
-REPORT
-
-  exec 3>&-
-  echo -e "${GREEN}[+] HTML report saved: $report_file${NC}"
-}
-
-generate_report "$outdir"
 
 ############################
 # Final Summary
