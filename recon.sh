@@ -311,18 +311,15 @@ if [ "$SKIP_KATANA" = false ]; then
     echo -e "${BLUE}[*] Running katana crawl${NC}"
     katana_opts=(
       -list "$live"
-      -d 1                          # depth 1
+      -d 3                          # depth 3
       -jc -jsluice
       -ef woff,css,svg,png,jpg,gif
       -silent
-      -c 5                          # max 5 concurrent fetchers
-      -p 10                         # max 10 concurrent host inputs
       -mdp 200                      # max 200 pages per domain
       -iqp                          # ignore different query-param values (dedup)
       -fsu                          # filter similar-looking URLs (e.g. /user/123 vs /user/456)
-      -fpt error,captcha,parked     # skip error/captcha/parked pages
-      -hrl 10                       # max 10 requests/sec per host
-      -ct 10                        # 10s request timeout
+      -timeout 10                   # 10s per-request timeout
+      -retry 1
       -o "$outdir/katana_urls.txt"
     )
     if [ -n "$PROXY" ]; then
